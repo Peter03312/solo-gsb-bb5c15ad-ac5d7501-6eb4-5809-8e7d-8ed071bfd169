@@ -10,7 +10,7 @@ from typing import Any
 
 from .db import utcnow_iso
 from .schemas import CalibrationIn, CalibrationVoidIn
-from .service import DomainError, _fingerprint, get_sample_or_404, to_utc_iso
+from .service import DomainError, _fingerprint, get_sample_or_404
 from .temperature import (
     _attribution_at,
     _config_view,
@@ -18,6 +18,7 @@ from .temperature import (
     _gap_intervals,
     _get_config_row,
 )
+from .timefmt import parse_iso, to_utc_iso
 
 
 # --------------------------------------------------------------------------- 视图与校验
@@ -110,13 +111,20 @@ def register_calibration(
             {"device_id": data.device_id},
         )
 
-    overlapping = conn.execute(
+    # 左闭右开时段重叠判定（valid_from < 其它.valid_to 且 其它.valid_from < valid_to）。
+    # 取该设备全部证明后在 Python 内按真实瞬间判定，避免同秒不同小数的字符串字典序误判。
+    candidates = conn.execute(
         "SELECT certificate_id, valid_from, valid_to FROM device_calibration"
         " WHERE device_id = ? AND certificate_id <> ? AND voided_at IS NULL"
-        " AND valid_from < ? AND valid_to > ?"
-        " ORDER BY valid_from ASC, id ASC",
-        (data.device_id, data.certificate_id, valid_to, valid_from),
+        " ORDER BY id ASC",
+        (data.device_id, data.certificate_id),
     ).fetchall()
+    new_from, new_to = parse_iso(valid_from), parse_iso(valid_to)
+    overlapping = [
+        r for r in candidates
+        if parse_iso(r["valid_from"]) < new_to and new_from < parse_iso(r["valid_to"])
+    ]
+    overlapping.sort(key=lambda r: (parse_iso(r["valid_from"]), r["certificate_id"]))
     if overlapping:
         raise DomainError(
             409,
@@ -197,13 +205,15 @@ def void_calibration(
 def list_calibrations(conn: sqlite3.Connection, device_id: str | None = None) -> dict[str, Any]:
     if device_id is not None:
         rows = conn.execute(
-            "SELECT * FROM device_calibration WHERE device_id = ? ORDER BY valid_from ASC, id ASC",
+            "SELECT * FROM device_calibration WHERE device_id = ? ORDER BY id ASC",
             (device_id,),
         ).fetchall()
+        rows.sort(key=lambda r: parse_iso(r["valid_from"]))
     else:
         rows = conn.execute(
-            "SELECT * FROM device_calibration ORDER BY device_id ASC, valid_from ASC, id ASC"
+            "SELECT * FROM device_calibration ORDER BY id ASC"
         ).fetchall()
+        rows.sort(key=lambda r: (r["device_id"], parse_iso(r["valid_from"])))
     return {
         "total": len(rows),
         "device_id": device_id,
@@ -217,9 +227,10 @@ def _missing_certificate_reason(
     rows: list[sqlite3.Row], occurred_at: str
 ) -> dict[str, Any]:
     """设备存在证明但读数时刻无有效证明时，给出缺证原因。"""
+    t = parse_iso(occurred_at)
     covering_void = [
         r for r in rows
-        if r["voided_at"] is not None and r["valid_from"] <= occurred_at < r["valid_to"]
+        if r["voided_at"] is not None and parse_iso(r["valid_from"]) <= t < parse_iso(r["valid_to"])
     ]
     active = [r for r in rows if r["voided_at"] is None]
     if covering_void:
@@ -230,19 +241,19 @@ def _missing_certificate_reason(
         }
 
     considered = active or rows
-    earliest = min(r["valid_from"] for r in considered)
-    latest_end = max(r["valid_to"] for r in considered)
-    if occurred_at < earliest:
+    earliest = min((parse_iso(r["valid_from"]) for r in considered), default=t)
+    latest_end = max((parse_iso(r["valid_to"]) for r in considered), default=t)
+    if t < earliest:
         return {
             "code": "before_calibration_validity",
             "message": "读数早于该设备校准证明有效起始时刻",
-            "earliest_valid_from": earliest,
+            "earliest_valid_from": min(r["valid_from"] for r in considered),
         }
-    if occurred_at >= latest_end:
+    if t >= latest_end:
         return {
             "code": "after_calibration_validity",
             "message": "读数不早于该设备校准证明有效结束时刻（结束时刻不含）",
-            "latest_valid_to": latest_end,
+            "latest_valid_to": max(r["valid_to"] for r in considered),
         }
     return {
         "code": "calibration_gap",
@@ -257,10 +268,10 @@ def _certificates_by_device(
         return {}
     marks = ",".join("?" for _ in device_ids)
     rows = conn.execute(
-        f"SELECT * FROM device_calibration WHERE device_id IN ({marks})"
-        " ORDER BY valid_from ASC, id ASC",
+        f"SELECT * FROM device_calibration WHERE device_id IN ({marks}) ORDER BY id ASC",
         tuple(device_ids),
     ).fetchall()
+    rows.sort(key=lambda r: (r["device_id"], parse_iso(r["valid_from"]), r["id"]))
     result: dict[str, list[sqlite3.Row]] = {d: [] for d in device_ids}
     for row in rows:
         result[row["device_id"]].append(row)
@@ -270,13 +281,14 @@ def _certificates_by_device(
 def _match_certificate(
     cert_rows: list[sqlite3.Row], occurred_at: str
 ) -> tuple[sqlite3.Row | None, dict[str, Any] | None]:
+    t = parse_iso(occurred_at)
     active = [
         r for r in cert_rows
-        if r["voided_at"] is None and r["valid_from"] <= occurred_at < r["valid_to"]
+        if r["voided_at"] is None and parse_iso(r["valid_from"]) <= t < parse_iso(r["valid_to"])
     ]
     if active:
         # 登记时已拒绝重叠；按最早起始稳定选取，避免异常数据导致结果不确定。
-        return sorted(active, key=lambda r: (r["valid_from"], r["id"]))[0], None
+        return sorted(active, key=lambda r: (parse_iso(r["valid_from"]), r["id"]))[0], None
     if not cert_rows:
         return None, {
             "code": "calibration_not_registered",
@@ -300,14 +312,16 @@ def get_trusted_temperature_review(
         )
 
     readings = conn.execute(
-        "SELECT * FROM temp_reading WHERE sample_id = ? ORDER BY occurred_at ASC, id ASC",
+        "SELECT * FROM temp_reading WHERE sample_id = ? ORDER BY id ASC",
         (sample["id"],),
     ).fetchall()
+    readings.sort(key=lambda r: (parse_iso(r["occurred_at"]), r["id"]))
     events = conn.execute(
         "SELECT * FROM custody_event WHERE sample_id = ? AND superseded_by IS NULL"
-        " ORDER BY occurred_at ASC, id ASC",
+        " ORDER BY id ASC",
         (sample["id"],),
     ).fetchall()
+    events.sort(key=lambda ev: (parse_iso(ev["occurred_at"]), ev["id"]))
     periods = _custody_periods(sample, events)
     certs_by_device = _certificates_by_device(conn, {r["device_id"] for r in readings})
 

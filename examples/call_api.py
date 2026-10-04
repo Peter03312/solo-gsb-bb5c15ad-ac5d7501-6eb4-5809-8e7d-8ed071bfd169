@@ -1001,6 +1001,48 @@ def main() -> None:
     })
     show("恢复原摘要后以新单号重新处置（201）", s, r, "disposition", "status")
 
+    # 20) 时间精度（小数秒）：同秒不同瞬间不被截断误判；带时区按真实瞬间归 UTC
+    print("\n=== 时间精度（小数秒 / 时区归一） ===")
+    mcode = f"API-MS-{run_id}"
+    s, r = call("POST", "/samples", {
+        "sample_code": mcode,
+        "collected_at": "2026-10-01T10:00:00.100Z",
+        "collector": collector, "seal_no": "SEAL-MS",
+    })
+    show("登记（采集 .100，保留小数秒）", s, r, "sample")
+    s, r = call("POST", "/events", {
+        "event_id": f"API-MS-T-{run_id}", "event_type": "transfer", "sample_code": mcode,
+        "occurred_at": "2026-10-01T10:00:00.200Z",
+        "transfer_no": "TR-MS", "from_custodian": collector, "to_custodian": "李运输",
+    })
+    show("移交 .200", s, r, "event")
+    # 签收 .300 严格晚于移交 .200（旧逻辑截去小数秒会误判为“不晚于”）
+    s, r = call("POST", "/events", {
+        "event_id": f"API-MS-R-{run_id}", "event_type": "receive", "sample_code": mcode,
+        "occurred_at": "2026-10-01T10:00:00.300Z",
+        "transfer_no": "TR-MS", "receiver": "李运输", "seal_no": "SEAL-MS",
+    })
+    show("签收 .300（同秒不同瞬间，仍严格晚于移交）", s, r, "evaluation", "status")
+    # 同秒三个不同瞬间的读数各自允许
+    call("POST", "/temperature-configs", {
+        "sample_code": mcode, "min_celsius": 2.0, "max_celsius": 8.0,
+        "max_interval_seconds": 1800,
+    })
+    for frac, rid in (("100", "R1"), ("200", "R2"), ("300", "R3")):
+        s, r = call("POST", "/temperature-readings", {
+            "sample_code": mcode, "reading_id": f"API-MS-{rid}-{run_id}",
+            "device_id": "DEV-MS", "occurred_at": f"2026-10-01T10:00:10.{frac}Z",
+            "value_celsius": 4.5,
+        })
+        print(f"  读数 .{frac} [HTTP {s}]")
+    # 不同时区表示的同一瞬间（18:00:10.200+08:00 == 10:00:10.200Z）→ reading_time_duplicate
+    s, r = call("POST", "/temperature-readings", {
+        "sample_code": mcode, "reading_id": f"API-MS-R4-{run_id}",
+        "device_id": "DEV-MS", "occurred_at": "2026-10-01T18:00:10.200+08:00",
+        "value_celsius": 4.5,
+    })
+    print(f"  同一瞬间（+08:00 表示）重复读数 → [HTTP {s}] {r.get('error', {}).get('code')}")
+
 
 if __name__ == "__main__":
     main()

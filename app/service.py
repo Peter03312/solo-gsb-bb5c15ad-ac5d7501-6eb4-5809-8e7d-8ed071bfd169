@@ -14,11 +14,16 @@
 import hashlib
 import json
 import sqlite3
-from datetime import datetime, timezone
 from typing import Any
 
 from . import config
 from .schemas import ApproveIn, CorrectionIn, EventIn, NewEventIn, SampleIn, TransferBatchIn
+from .timefmt import (
+    instant_le,
+    instant_lt,
+    parse_iso,
+    to_utc_iso,
+)
 
 LAB_CUSTODIAN = "实验室"
 
@@ -36,11 +41,9 @@ class DomainError(Exception):
 
 # --------------------------------------------------------------------------- 通用工具
 
-def to_utc_iso(dt: datetime) -> str:
-    """统一规范为 UTC ISO8601（秒精度、Z 结尾），无时区输入按 UTC 处理。"""
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+def _event_sort_key(ev: sqlite3.Row) -> tuple[Any, int]:
+    """事件按真实发生瞬间升序、同瞬间按行 id 升序（不依赖字符串字典序，兼容小数秒）。"""
+    return parse_iso(ev["occurred_at"]), ev["id"]
 
 
 def _fingerprint(obj: dict[str, Any]) -> str:
@@ -248,9 +251,11 @@ def evaluate(conn: sqlite3.Connection, sample: sqlite3.Row) -> dict[str, Any]:
     其内容经 superseded_events 与 corrections 永久留痕、可追溯。
     """
     all_rows = conn.execute(
-        "SELECT * FROM custody_event WHERE sample_id = ? ORDER BY occurred_at ASC, id ASC",
+        "SELECT * FROM custody_event WHERE sample_id = ? ORDER BY id ASC",
         (sample["id"],),
     ).fetchall()
+    # 按真实发生瞬间排序（小数秒不被截断），同瞬间以行 id（提交先后）决胜
+    all_rows.sort(key=_event_sort_key)
     events = [e for e in all_rows if e["superseded_by"] is None]
     superseded_rows = [e for e in all_rows if e["superseded_by"] is not None]
 
@@ -288,7 +293,7 @@ def evaluate(conn: sqlite3.Connection, sample: sqlite3.Row) -> dict[str, Any]:
         )
 
         # 任何事件早于采集时间：记录无效（不可能在登记采集前发生保管动作）
-        if ev["occurred_at"] < sample["collected_at"]:
+        if instant_lt(ev["occurred_at"], sample["collected_at"]):
             invalid_reasons.append(f"{ref} 事件发生时间 {ev['occurred_at']} 早于样本采集时间 {sample['collected_at']}")
             continue
 
@@ -317,7 +322,7 @@ def evaluate(conn: sqlite3.Connection, sample: sqlite3.Row) -> dict[str, Any]:
                 continue
             known = transfer_by_no.get(no)
             if open_transfer is None or open_transfer["transfer_no"] != no:
-                if known is not None and ev["occurred_at"] <= known["row"]["occurred_at"]:
+                if known is not None and instant_le(ev["occurred_at"], known["row"]["occurred_at"]):
                     invalid_reasons.append(
                         f"{ref} 签收时间 {ev['occurred_at']} 不晚于移交时间 {known['row']['occurred_at']}（单号 {no}）"
                     )
@@ -337,7 +342,7 @@ def evaluate(conn: sqlite3.Connection, sample: sqlite3.Row) -> dict[str, Any]:
                     f"{ref} 封签号不符：签收封签 {p['seal_no']} ≠ 登记封签 {sample['seal_no']}"
                 )
                 mismatch = True
-            if ev["occurred_at"] <= open_transfer["occurred_at"]:
+            if instant_le(ev["occurred_at"], open_transfer["occurred_at"]):
                 invalid_reasons.append(
                     f"{ref} 签收时间 {ev['occurred_at']} 不晚于移交时间 {open_transfer['occurred_at']}（单号 {no}）"
                 )
@@ -360,7 +365,7 @@ def evaluate(conn: sqlite3.Connection, sample: sqlite3.Row) -> dict[str, Any]:
                 invalid_reasons.append(f"{ref} 封签检查发现封签破损/不完好")
 
         else:  # storage
-            if last_receive_at is not None and ev["occurred_at"] < last_receive_at:
+            if last_receive_at is not None and instant_lt(ev["occurred_at"], last_receive_at):
                 invalid_reasons.append(
                     f"{ref} 入库时间 {ev['occurred_at']} 早于最终签收时间 {last_receive_at}（保管链不成立）"
                 )

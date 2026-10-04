@@ -1,11 +1,28 @@
-"""HTTP 请求体的 Pydantic 模型与按事件类型的必填字段校验。"""
-from datetime import datetime
+"""HTTP 请求体的 Pydantic 模型与按事件类型的必填字段校验。
+
+时间字段均为 ISO 8601：带时区（``Z`` / ``±HH:MM`` 等偏移）按真实瞬间换算到 UTC，
+无时区输入按 UTC 解释；小数秒（毫秒/微秒）被保留并参与全部时间判定，绝不截断。
+"""
+from datetime import datetime, timezone
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 EventType = Literal["transfer", "receive", "seal_check", "storage"]
 CorrectionAction = Literal["void", "replace"]
+
+
+def _coerce_utc(v: datetime) -> datetime:
+    """无时区时间按 UTC 解释；带时区时间保持真实瞬间并归一到 UTC。
+
+    Pydantic 对带时区与无时区输入会分别产出 aware / naive datetime，若混用会在
+    比较时抛 TypeError（500）。在字段校验边界统一归一到 aware-UTC，保证服务层
+    所有比较对象同型；归一不损失小数秒精度。
+    """
+    if v.tzinfo is None:
+        return v.replace(tzinfo=timezone.utc)
+    return v.astimezone(timezone.utc)
+
 
 # 各事件类型的必填字段（事件上报与纠错替换共用）
 REQUIRED_FIELDS: dict[str, list[str]] = {
@@ -20,9 +37,11 @@ class SampleIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     sample_code: str = Field(..., min_length=1, description="样本编号，业务唯一键")
-    collected_at: datetime = Field(..., description="采集时间 ISO8601")
+    collected_at: datetime = Field(..., description="采集时间 ISO8601（带时区按真实瞬间归 UTC；无时区按 UTC；保留小数秒）")
     collector: str = Field(..., min_length=1, description="采集人，即初始保管人")
     seal_no: str = Field(..., min_length=1, description="封签号")
+
+    _collected_at_utc = field_validator("collected_at")(_coerce_utc)
 
 
 class EventIn(BaseModel):
@@ -51,6 +70,8 @@ class EventIn(BaseModel):
     custodian: str | None = Field(None, description="入库后保管人，默认实验室")
 
     note: str | None = Field(None, description="备注，参与幂等指纹")
+
+    _occurred_at_utc = field_validator("occurred_at")(_coerce_utc)
 
     @model_validator(mode="after")
     def _check_required_fields(self) -> "EventIn":
@@ -90,6 +111,8 @@ class NewEventIn(BaseModel):
     custodian: str | None = Field(None, description="入库后保管人，默认实验室")
 
     note: str | None = Field(None, description="备注，参与幂等指纹")
+
+    _occurred_at_utc = field_validator("occurred_at")(_coerce_utc)
 
     @model_validator(mode="after")
     def _check_required_fields(self) -> "NewEventIn":
@@ -155,10 +178,12 @@ class TransferBatchIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     batch_id: str = Field(..., min_length=1, description="全局唯一批次号，同号重试幂等")
-    occurred_at: datetime = Field(..., description="统一移交时间 ISO8601")
+    occurred_at: datetime = Field(..., description="统一移交时间 ISO8601（带时区归 UTC；无时区按 UTC；保留小数秒）")
     from_custodian: str = Field(..., min_length=1, description="交出人")
     to_custodian: str = Field(..., min_length=1, description="接收人")
     items: list[BatchTransferItemIn] = Field(..., min_length=1, description="批内各份样本（至少一份）")
+
+    _occurred_at_utc = field_validator("occurred_at")(_coerce_utc)
 
 
 class BatchReconciliationItemIn(BaseModel):
@@ -212,8 +237,10 @@ class BatchReconciliationIn(BaseModel):
 
     reconciliation_no: str = Field(..., min_length=1, description="全局唯一签收单号，同号重试幂等")
     receiver: str = Field(..., min_length=1, description="签收人（须匹配各收妥项在途移交的接收人）")
-    occurred_at: datetime = Field(..., description="统一签收时间 ISO8601（须晚于各份移交时间）")
+    occurred_at: datetime = Field(..., description="统一签收时间 ISO8601（须晚于各份移交时间；保留小数秒）")
     items: list[BatchReconciliationItemIn] = Field(..., min_length=1, description="逐份对账清单（须恰好覆盖原批次全部样本）")
+
+    _occurred_at_utc = field_validator("occurred_at")(_coerce_utc)
 
 
 class DossierItemIn(BaseModel):
@@ -352,8 +379,10 @@ class TempReadingIn(BaseModel):
     sample_code: str = Field(..., min_length=1, description="样本编号")
     reading_id: str = Field(..., min_length=1, description="全局唯一读数号，同号重试幂等")
     device_id: str = Field(..., min_length=1, description="测温设备号")
-    occurred_at: datetime = Field(..., description="读数发生时间 ISO8601（不得早于采集时间）")
+    occurred_at: datetime = Field(..., description="读数发生时间 ISO8601（带时区归 UTC；无时区按 UTC；保留小数秒；不得早于采集时间）")
     value_celsius: float = Field(..., allow_inf_nan=False, description="摄氏温度读数（有限数值）")
+
+    _occurred_at_utc = field_validator("occurred_at")(_coerce_utc)
 
 
 class CalibrationIn(BaseModel):
@@ -363,9 +392,12 @@ class CalibrationIn(BaseModel):
 
     certificate_id: str = Field(..., min_length=1, description="全局唯一校准证明号，同号重试幂等")
     device_id: str = Field(..., min_length=1, description="测温设备号；须已有测温读数")
-    valid_from: datetime = Field(..., description="证明有效起始时刻（含，ISO8601）")
-    valid_to: datetime = Field(..., description="证明有效结束时刻（不含，ISO8601）")
+    valid_from: datetime = Field(..., description="证明有效起始时刻（含，ISO8601，保留小数秒）")
+    valid_to: datetime = Field(..., description="证明有效结束时刻（不含，ISO8601，保留小数秒）")
     issued_by: str = Field(..., min_length=1, description="证明签发人")
+
+    _valid_from_utc = field_validator("valid_from")(_coerce_utc)
+    _valid_to_utc = field_validator("valid_to")(_coerce_utc)
 
     @model_validator(mode="after")
     def _check_validity_period(self) -> "CalibrationIn":

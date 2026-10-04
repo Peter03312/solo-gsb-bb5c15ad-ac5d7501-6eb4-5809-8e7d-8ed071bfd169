@@ -27,9 +27,14 @@ from .service import (
     _fingerprint,
     evaluate,
     get_batch_item_effective_transfer,
-    to_utc_iso,
 )
+from .timefmt import instant_gt, instant_lt, to_utc_iso
 from .versions import CHANGE_EVENT, latest_version_no, record_version
+
+
+def _strictly_after(candidate: str, reference: str) -> bool:
+    """签收时间是否严格晚于移交时间（同秒不同小数按真实瞬间判定）。"""
+    return instant_gt(candidate, reference)
 
 
 def _reconciliation_fingerprint(batch_id: str, data: BatchReconciliationIn) -> tuple[str, str]:
@@ -152,7 +157,7 @@ def _validate_received_item(
             "message": f"实核封签号 {item.verified_seal_no} ≠ 登记封签号 {sample['seal_no']}",
         })
         qualified = False
-    if occurred_iso <= eff["occurred_at"]:
+    if not _strictly_after(occurred_iso, eff["occurred_at"]):
         invalid_items.append({
             **base,
             "code": "receive_time_invalid",
@@ -160,7 +165,7 @@ def _validate_received_item(
                        f"（单号 {eff_payload['transfer_no']}）",
         })
         qualified = False
-    if occurred_iso < sample["collected_at"]:
+    if instant_lt(occurred_iso, sample["collected_at"]):
         invalid_items.append({
             **base,
             "code": "receive_time_invalid",
