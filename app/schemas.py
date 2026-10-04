@@ -1,5 +1,5 @@
 """HTTP 请求体的 Pydantic 模型与按事件类型的必填字段校验。"""
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -369,7 +369,10 @@ class CalibrationIn(BaseModel):
 
     @model_validator(mode="after")
     def _check_validity_period(self) -> "CalibrationIn":
-        if self.valid_to <= self.valid_from:
+        # 无时区输入按 UTC 解释后再比较真实瞬间，避免 naive/aware 混用时 TypeError。
+        vf = self.valid_from if self.valid_from.tzinfo is not None else self.valid_from.replace(tzinfo=timezone.utc)
+        vt = self.valid_to if self.valid_to.tzinfo is not None else self.valid_to.replace(tzinfo=timezone.utc)
+        if vt <= vf:
             raise ValueError("校准证明有效期必须满足 valid_from < valid_to（左闭右开，空时段无效）")
         if not self.issued_by.strip():
             raise ValueError("校准证明签发人不得为空白")

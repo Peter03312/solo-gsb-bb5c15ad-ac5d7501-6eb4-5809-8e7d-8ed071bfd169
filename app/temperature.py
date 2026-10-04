@@ -17,7 +17,7 @@
 """
 import json
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from .db import utcnow_iso
@@ -27,7 +27,9 @@ from .service import (
     LAB_CUSTODIAN,
     _fingerprint,
     ensure_unlocked,
+    event_time_key,
     get_sample_or_404,
+    parse_iso,
     to_utc_iso,
 )
 
@@ -35,11 +37,13 @@ from .service import (
 # --------------------------------------------------------------------------- 通用工具
 
 def _parse_iso(s: str) -> datetime:
-    return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    return parse_iso(s)
 
 
-def _seconds_between(start: str, end: str) -> int:
-    return int((_parse_iso(end) - _parse_iso(start)).total_seconds())
+def _seconds_number(start: str, end: str) -> int | float:
+    """相邻瞬间的秒数：整秒差返回 int（既有输出形态），含小数秒时返回精确 float。"""
+    secs = (_parse_iso(end) - _parse_iso(start)).total_seconds()
+    return int(secs) if float(secs).is_integer() else secs
 
 
 def _get_config_row(conn: sqlite3.Connection, sample_id: int) -> sqlite3.Row | None:
@@ -171,7 +175,7 @@ def create_temp_reading(conn: sqlite3.Connection, data: TempReadingIn) -> tuple[
             f"样本 {data.sample_code} 尚未设定测温配置，须先一次性设定允许温度区间与最大测温间隔",
             {"sample_code": data.sample_code},
         )
-    if occurred < sample["collected_at"]:
+    if parse_iso(occurred) < parse_iso(sample["collected_at"]):
         raise DomainError(
             422,
             "reading_before_collection",
@@ -245,11 +249,12 @@ def _custody_periods(sample: sqlite3.Row, events: list[sqlite3.Row]) -> list[dic
     """
     periods: list[dict[str, Any]] = []
     current = sample["collector"]
-    open_transfer: dict[str, Any] | None = None     # 在途移交（内部含 occurred_at）
+    open_transfer: dict[str, Any] | None = None     # 在途移交（内部含 occurred_at/_time）
     closed_nos: set[str] = set()
-    last_receive_at: str | None = None
+    last_receive_at: datetime | None = None
     broken_detail: str | None = None
     cursor = sample["collected_at"]
+    cursor_t = parse_iso(cursor)
 
     def attribution() -> dict[str, Any]:
         if broken_detail is not None:
@@ -269,14 +274,15 @@ def _custody_periods(sample: sqlite3.Row, events: list[sqlite3.Row]) -> list[dic
         if et == "seal_check":
             continue                                    # 封签检查不影响保管归属
         t = ev["occurred_at"]
+        t_dt = parse_iso(t)
         p = json.loads(ev["payload_json"])
         ref = f"[事件 {ev['event_id']}]"
-        if t < sample["collected_at"]:
+        if t_dt < parse_iso(sample["collected_at"]):
             continue                                    # 采集前事件无效，保管归属尚未开始
         # 先以事件发生前状态关闭 [cursor, t) 时段，再应用该事件
-        if t > cursor:
+        if t_dt > cursor_t:
             periods.append({"start": cursor, "end": t, "attribution": attribution()})
-            cursor = t
+            cursor, cursor_t = t, t_dt
 
         if et == "transfer":
             if open_transfer is not None:
@@ -299,6 +305,7 @@ def _custody_periods(sample: sqlite3.Row, events: list[sqlite3.Row]) -> list[dic
                     "to_custodian": p["to_custodian"],
                     "transfer_event_id": ev["event_id"],
                     "occurred_at": t,
+                    "_time": t_dt,
                 }
         elif et == "receive":
             no = p["transfer_no"]
@@ -311,15 +318,15 @@ def _custody_periods(sample: sqlite3.Row, events: list[sqlite3.Row]) -> list[dic
                     )
             elif (p["receiver"] != open_transfer["to_custodian"]
                   or p["seal_no"] != sample["seal_no"]
-                  or t <= open_transfer["occurred_at"]):
+                  or t_dt <= open_transfer["_time"]):
                 pass                                    # 签收要素不符：在途保持，归属仍可确定
             else:
                 closed_nos.add(no)
                 current = p["receiver"]
-                last_receive_at = t
+                last_receive_at = t_dt
                 open_transfer = None
         else:  # storage
-            if last_receive_at is not None and t < last_receive_at:
+            if last_receive_at is not None and t_dt < last_receive_at:
                 pass                                    # 入库早于最终签收：无效，保管状态不变
             elif open_transfer is not None or last_receive_at is None:
                 pass                                    # 缺前序链的入库：待补证，保管状态不变
@@ -332,8 +339,11 @@ def _custody_periods(sample: sqlite3.Row, events: list[sqlite3.Row]) -> list[dic
 
 def _attribution_at(periods: list[dict[str, Any]], t: str) -> dict[str, Any]:
     """时刻 t 的保管归属；时刻与事件对齐时按事件已发生处理。"""
+    t_dt = parse_iso(t)
     for period in periods:
-        if period["start"] <= t and (period["end"] is None or t < period["end"]):
+        if parse_iso(period["start"]) <= t_dt and (
+            period["end"] is None or t_dt < parse_iso(period["end"])
+        ):
             return period["attribution"]
     return {"kind": "pending_review", "detail": "时刻早于样本采集时间，归属不能确定"}
 
@@ -344,23 +354,30 @@ def _gap_intervals(
     split_events: list[sqlite3.Row],
     periods: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """按相邻读数计算超间隔缺测区间，并沿用保管链区间拆分与归属。"""
-    split_times = sorted({
-        ev["occurred_at"] for ev in split_events if ev["event_type"] in ("transfer", "receive")
-    })
+    """按相邻读数计算超间隔缺测区间，并沿用保管链区间拆分与归属。
+
+    “超过最大间隔”按真实瞬间严格判定（差值 > max_interval；等于限值不报），
+    小数秒不被截断。跨移交/签收时刻的拆分点同样按真实瞬间选取与排序。
+    """
+    split_times = sorted(
+        {ev["occurred_at"] for ev in split_events if ev["event_type"] in ("transfer", "receive")},
+        key=parse_iso,
+    )
     gaps: list[dict[str, Any]] = []
     for prev, nxt in zip(readings, readings[1:]):
-        duration = _seconds_between(prev["occurred_at"], nxt["occurred_at"])
-        if duration <= max_interval:
+        delta = parse_iso(nxt["occurred_at"]) - parse_iso(prev["occurred_at"])
+        if delta <= timedelta(seconds=max_interval):
             continue
+        duration = _seconds_number(prev["occurred_at"], nxt["occurred_at"])
+        prev_t, nxt_t = parse_iso(prev["occurred_at"]), parse_iso(nxt["occurred_at"])
         bounds = [prev["occurred_at"]]
-        bounds += [t for t in split_times if prev["occurred_at"] < t < nxt["occurred_at"]]
+        bounds += [t for t in split_times if prev_t < parse_iso(t) < nxt_t]
         bounds.append(nxt["occurred_at"])
         segments = [
             {
                 "start": a,
                 "end": b,
-                "duration_seconds": _seconds_between(a, b),
+                "duration_seconds": _seconds_number(a, b),
                 "attribution": _attribution_at(periods, a),
             }
             for a, b in zip(bounds, bounds[1:])
@@ -395,14 +412,15 @@ def get_temperature_review(conn: sqlite3.Connection, sample_code: str) -> dict[s
         )
 
     readings = conn.execute(
-        "SELECT * FROM temp_reading WHERE sample_id = ? ORDER BY occurred_at ASC, id ASC",
+        "SELECT * FROM temp_reading WHERE sample_id = ?",
         (sample["id"],),
     ).fetchall()
+    readings.sort(key=event_time_key)
     events = conn.execute(
-        "SELECT * FROM custody_event WHERE sample_id = ? AND superseded_by IS NULL"
-        " ORDER BY occurred_at ASC, id ASC",
+        "SELECT * FROM custody_event WHERE sample_id = ? AND superseded_by IS NULL",
         (sample["id"],),
     ).fetchall()
+    events.sort(key=event_time_key)
     periods = _custody_periods(sample, events)
 
     min_c = config["min_celsius"]

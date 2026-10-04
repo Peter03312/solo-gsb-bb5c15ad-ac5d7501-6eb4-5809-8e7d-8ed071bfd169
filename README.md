@@ -161,7 +161,14 @@ curl http://localhost:8080/api/v1/samples        # 查看 3 条演示样本的�
 
 ## 五、HTTP API
 
-所有时间均使用 ISO 8601（建议 UTC，如 `2026-09-30T02:00:00Z`；带时区偏移亦可，内部统一转 UTC）。
+所有时间均使用 ISO 8601，并**按真实瞬间（含小数秒精度）归一到 UTC**：
+
+- 带时区偏移的输入按偏移换算（`2026-10-04T18:00:00.100+08:00` → `2026-10-04T10:00:00.100000Z`）；**无时区输入仍按 UTC 解释**（`2026-10-04T10:00:00.100` → `...10:00:00.100000Z`）。
+- 小数秒（毫秒/微秒）**原样保留、不再截断到整秒**：同一秒内的不同瞬间（如 `10:00:00.100` 采集、`10:00:00.200` 移交、`10:00:00.300` 签收）按不同时刻参与排序与全部先后判定；**整秒**输入落库与响仍为整秒文本（`2026-09-30T02:00:00Z`），故既有整秒记录的同号重试指纹、查询结果完全不变。
+- 所有“晚于/不晚于/早于/区间覆盖/间隔超限”均比较归一后的真实瞬间：签收须**严格晚于**移交（同瞬间即不合格）、读数“同一发生时刻”去重以归一后的瞬间为准（`...10:00:00.200Z` 与 `...18:00:00.200+08:00` 是同一瞬间，判重复）、校准证明按左闭右开 `[valid_from, valid_to)` 覆盖、缺测区间**严格大于**最大间隔（等于限值不报，小数秒不被向下取整）。
+- 无效时间文本（如 `"not-a-time"`）仍按既有语义返回 `422`；真实同一瞬间的业务冲突（同号异内容、重复发生时刻、证明时段重叠等）仍返回对应 `409/422`，失败事务回滚、不留部分写入。
+
+时间精度用法与 HTTP 调用示例见 **5.14 时间精度（小数秒）用法**。
 
 ### 5.1 样本登记
 
@@ -1292,6 +1299,70 @@ curl -X POST http://localhost:8080/api/v1/samples/S-001/temperature/anomalies/di
 ```
 
 批量移交（`POST /transfer-batches`）、整批对账签收（`POST /transfer-batches/{batch_id}/reconciliation` 的收妥项）、读数补录、校准证明登记/作废触发同样的提交点判定；失败操作（整批/整单拒绝、冲突、校验失败）与同内容幂等重试不触发失效。
+
+### 5.14 时间精度（小数秒）用法
+
+系统不再把时间截去小数秒：带时区的 ISO 8601 输入按**真实瞬间**归一到 UTC（无时区按 UTC），毫秒/微秒参与保管链排序与核验、批量移交与整批签收、读数同一瞬间去重与缺测严格超间隔、校准证明左闭右开覆盖与重叠、可信异常及证据摘要的全部判定。
+
+| 输入写法 | 归一落库 / 响应 | 说明 |
+|---|---|---|
+| `2026-10-04T10:00:00Z` | `2026-10-04T10:00:00Z` | 整秒：文本保持秒精度（既有记录与重试指纹不变） |
+| `2026-10-04T10:00:00.100Z` | `2026-10-04T10:00:00.100000Z` | 毫秒小数秒保留为微秒精度 |
+| `2026-10-04T10:00:00.123456Z` | `2026-10-04T10:00:00.123456Z` | 微秒精度原样保留 |
+| `2026-10-04T18:00:00.100+08:00` | `2026-10-04T10:00:00.100000Z` | 带偏移：按真实瞬间换算到 UTC |
+| `2026-10-04T10:00:00.100` | `2026-10-04T10:00:00.100000Z` | 无时区：按 UTC 解释（不随部署地时区变化） |
+| `not-a-time` | `422`（请求体字段校验） | 无效时间仍按既有错误语义拒绝 |
+
+判定语义（均对归一后的真实瞬间生效）：
+
+- **保管链排序/核验**：时间线按真实瞬间排序；签收时间必须**严格晚于**移交时间——`...00.200Z` 移交、`...00.300Z` 签收为合格，同秒两个不同瞬间不再被判为“不晚于”；真实同一瞬间（含不同时区表示）仍判“不晚于”而无效。
+- **批量移交 / 整批对账签收**：统一移交/签收时间保留小数秒；收妥项须晚于该份移交瞬间、不早于采集瞬间，整单原子失败不留记录。
+- **读数去重 / 缺测**：同一样本同一瞬间（归一后）只允许一条读数，同秒不同瞬间允许并存；相邻读数间隔**严格大于** `max_interval_seconds` 才报缺测（等于不报），`duration_seconds` 在含小数秒时给出精确小数值（如 `60.6`），整秒时仍为整数。
+- **校准证明**：`[valid_from, valid_to)` 左闭右开——覆盖起点瞬间、不覆盖终点瞬间；端点相邻（前证 `valid_to` = 后证 `valid_from`）允许，真实重叠（含小数秒）按 `409 calibration_overlap` 拒绝。
+- **幂等 / 冲突**：指纹基于归一后的 UTC 瞬间，`...00.200Z` 与等价偏移表示的同号重试为同内容（200）；改为另一瞬间（如 `.201`）即异内容（409），不会因截断被误判为同内容或时间冲突。
+- **历史不可改写**：历史版本快照与已封存案卷保存写入时的时间文本，小数秒精度修复不重写任何旧记录；旧整秒记录的查询与同号重试行为保持。
+
+curl 示例（同秒三个不同瞬间构成完整保管链）：
+
+```bash
+# 采集 10:00:00.100 → 移交 .200 → 签收 .300 → 入库 .500，结论 valid
+curl -X POST http://localhost:8080/api/v1/samples -H 'Content-Type: application/json' -d '{
+  "sample_code":"S-FRAC","collected_at":"2026-10-04T10:00:00.100Z",
+  "collector":"王采集","seal_no":"SEAL-1"}'
+curl -X POST http://localhost:8080/api/v1/events -H 'Content-Type: application/json' -d '{
+  "event_id":"FRAC-T","event_type":"transfer","sample_code":"S-FRAC",
+  "occurred_at":"2026-10-04T10:00:00.200Z",
+  "transfer_no":"TR-FRAC","from_custodian":"王采集","to_custodian":"李运输"}'
+curl -X POST http://localhost:8080/api/v1/events -H 'Content-Type: application/json' -d '{
+  "event_id":"FRAC-R","event_type":"receive","sample_code":"S-FRAC",
+  "occurred_at":"2026-10-04T10:00:00.300Z",
+  "transfer_no":"TR-FRAC","receiver":"李运输","seal_no":"SEAL-1"}'
+# 带时区偏移的等价瞬间（=10:00:00.300Z）作同号重试 → 200 幂等；改成 .301 → 409 异内容
+curl -X POST http://localhost:8080/api/v1/events -H 'Content-Type: application/json' -d '{
+  "event_id":"FRAC-R","event_type":"receive","sample_code":"S-FRAC",
+  "occurred_at":"2026-10-04T18:00:00.300+08:00",
+  "transfer_no":"TR-FRAC","receiver":"李运输","seal_no":"SEAL-1"}'
+```
+
+测温读数与校准证明的小数秒示例：
+
+```bash
+curl -X POST http://localhost:8080/api/v1/temperature-configs -H 'Content-Type: application/json' -d '{
+  "sample_code":"S-FRAC","min_celsius":2,"max_celsius":8,"max_interval_seconds":60}'
+# 同秒两个不同瞬间：两条读数都接受（不判重复）
+curl -X POST http://localhost:8080/api/v1/temperature-readings -H 'Content-Type: application/json' -d '{
+  "sample_code":"S-FRAC","reading_id":"RD-1","device_id":"DEV-1",
+  "occurred_at":"2026-10-04T10:01:00.100Z","value_celsius":5.0}'
+curl -X POST http://localhost:8080/api/v1/temperature-readings -H 'Content-Type: application/json' -d '{
+  "sample_code":"S-FRAC","reading_id":"RD-2","device_id":"DEV-1",
+  "occurred_at":"2026-10-04T10:01:00.200Z","value_celsius":5.0}'
+# 再用等价时区表示提交 .200 → 409 reading_time_duplicate（真实同一瞬间）
+# 左闭右开证明：覆盖 .100（含起点）、不覆盖 .200（终点不含）
+curl -X POST http://localhost:8080/api/v1/temperature-calibrations -H 'Content-Type: application/json' -d '{
+  "certificate_id":"CAL-FRAC","device_id":"DEV-1",
+  "valid_from":"2026-10-04T10:01:00.100Z","valid_to":"2026-10-04T10:01:00.200Z",
+  "issued_by":"计量员"}'
+```
 
 ### 错误响应统一格式
 

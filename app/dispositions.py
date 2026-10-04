@@ -37,7 +37,7 @@ from typing import Any
 from .calibrations import _certificates_by_device, _match_certificate, get_trusted_temperature_review
 from .db import utcnow_iso
 from .schemas import AnomalyDispositionIn
-from .service import DomainError, _fingerprint, get_sample_or_404
+from .service import DomainError, _fingerprint, get_sample_or_404, parse_iso
 from .temperature import _get_config_row
 
 DECISION_ACK = "acknowledged"   # 认可异常
@@ -379,7 +379,7 @@ def list_anomaly_view(conn: sqlite3.Connection, sample_code: str) -> dict[str, A
             active_by_anomaly.get(view["anomaly_id"]),
             history_by_anomaly.get(view["anomaly_id"], []),
         ))
-    items.sort(key=lambda x: (x["time_range"]["start"], x["anomaly_id"]))
+    items.sort(key=lambda x: (parse_iso(x["time_range"]["start"]), x["anomaly_id"]))
 
     return {
         "sample_code": sample["sample_code"],

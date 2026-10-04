@@ -1002,5 +1002,42 @@ def main() -> None:
     show("恢复原摘要后以新单号重新处置（201）", s, r, "disposition", "status")
 
 
+    # 20) 时间精度（小数秒）：同秒不同瞬间按真实时刻区分；等价时区表示归一为同一瞬间
+    print("\n=== 时间精度（小数秒 / 时区归一） ===")
+    run_p = uuid.uuid4().hex[:8]
+    pcode = f"API-FRAC-{run_p}"
+    call("POST", "/samples", {
+        "sample_code": pcode, "collected_at": f"2026-10-04T10:00:00.100Z",
+        "collector": collector, "seal_no": f"SEAL-FRAC-{run_p}",
+    })
+    # 采集 .100 → 移交 .200 → 签收 .300（同秒不同瞬间，不再被截成同一刻）
+    call("POST", "/events", {
+        "event_id": f"API-FRAC-T-{run_p}", "event_type": "transfer", "sample_code": pcode,
+        "occurred_at": "2026-10-04T10:00:00.200Z",
+        "transfer_no": f"TR-FRAC-{run_p}", "from_custodian": collector, "to_custodian": "李运输",
+    })
+    s, r = call("POST", "/events", {
+        "event_id": f"API-FRAC-R-{run_p}", "event_type": "receive", "sample_code": pcode,
+        "occurred_at": "2026-10-04T10:00:00.300Z",
+        "transfer_no": f"TR-FRAC-{run_p}", "receiver": "李运输", "seal_no": f"SEAL-FRAC-{run_p}",
+    })
+    print(f"小数秒签收（.300 严格晚于 .200）[HTTP {s}] 保管人:",
+          r["evaluation"]["current_custodian"], "| 原因:", r["evaluation"]["reasons"])
+    # 等价时区表示（=10:00:00.300Z）同号重试 → 200 幂等
+    s, r = call("POST", "/events", {
+        "event_id": f"API-FRAC-R-{run_p}", "event_type": "receive", "sample_code": pcode,
+        "occurred_at": "2026-10-04T18:00:00.300+08:00",
+        "transfer_no": f"TR-FRAC-{run_p}", "receiver": "李运输", "seal_no": f"SEAL-FRAC-{run_p}",
+    })
+    print("等价时区表示同号重试:", s, "幂等=", r.get("idempotent"))
+    # 改成另一瞬间（.301）同号 → 409 异内容（不因截断误判为同内容）
+    s, r = call("POST", "/events", {
+        "event_id": f"API-FRAC-R-{run_p}", "event_type": "receive", "sample_code": pcode,
+        "occurred_at": "2026-10-04T18:00:00.301+08:00",
+        "transfer_no": f"TR-FRAC-{run_p}", "receiver": "李运输", "seal_no": f"SEAL-FRAC-{run_p}",
+    })
+    print("同号改到另一瞬间（异内容冲突）:", s, r.get("error", {}).get("code"))
+
+
 if __name__ == "__main__":
     main()

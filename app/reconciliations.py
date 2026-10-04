@@ -27,6 +27,7 @@ from .service import (
     _fingerprint,
     evaluate,
     get_batch_item_effective_transfer,
+    parse_iso,
     to_utc_iso,
 )
 from .versions import CHANGE_EVENT, latest_version_no, record_version
@@ -137,6 +138,8 @@ def _validate_received_item(
         return None
 
     # 既有单份签收规则：签收人=接收方、实核封签=登记封签、签收时间晚于移交时间
+    # （比较按真实瞬间，保留小数秒，不做整秒截断）
+    occurred_t = parse_iso(occurred_iso)
     qualified = True
     if receiver != eff_payload["to_custodian"]:
         invalid_items.append({
@@ -152,7 +155,7 @@ def _validate_received_item(
             "message": f"实核封签号 {item.verified_seal_no} ≠ 登记封签号 {sample['seal_no']}",
         })
         qualified = False
-    if occurred_iso <= eff["occurred_at"]:
+    if occurred_t <= parse_iso(eff["occurred_at"]):
         invalid_items.append({
             **base,
             "code": "receive_time_invalid",
@@ -160,7 +163,7 @@ def _validate_received_item(
                        f"（单号 {eff_payload['transfer_no']}）",
         })
         qualified = False
-    if occurred_iso < sample["collected_at"]:
+    if occurred_t < parse_iso(sample["collected_at"]):
         invalid_items.append({
             **base,
             "code": "receive_time_invalid",

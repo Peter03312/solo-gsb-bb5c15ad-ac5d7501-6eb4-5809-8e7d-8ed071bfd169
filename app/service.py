@@ -37,10 +37,34 @@ class DomainError(Exception):
 # --------------------------------------------------------------------------- 通用工具
 
 def to_utc_iso(dt: datetime) -> str:
-    """统一规范为 UTC ISO8601（秒精度、Z 结尾），无时区输入按 UTC 处理。"""
+    """按真实瞬间规范为 UTC ISO8601（Z 结尾）：
+
+    * 带时区输入按实际偏移换算到 UTC（如 10:00:00.100+08:00 → 02:00:00.100Z），
+      无时区输入仍按 UTC 解释；
+    * 保留输入的小数秒精度（微秒），不再截断——同秒不同瞬间必须可区分；
+    * 整秒瞬间不带小数部分（``...00Z``），以保持既有整秒记录的落库文本与指纹不变，
+      已有整秒记录的同号重试/查询行为完全兼容。
+    """
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    dt = dt.astimezone(timezone.utc)
+    if dt.microsecond:
+        return dt.isoformat(timespec="microseconds").replace("+00:00", "Z")
+    return dt.isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def parse_iso(s: str) -> datetime:
+    """解析库存 UTC ISO8601 文本为带时区 datetime（真实瞬间，供时间比较/排序）。"""
+    return datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+
+def event_time_key(row: sqlite3.Row) -> tuple[datetime, int]:
+    """事件/读数按真实发生瞬间排序的键（同瞬间再按插入先后 id）。
+
+    库中 occurred_at 文本允许整秒（``...00Z``）与小数秒（``...00.100000Z``）
+    两种形态，SQL/字典序无法正确排序，统一以解析后的 UTC 瞬间比较。
+    """
+    return parse_iso(row["occurred_at"]), row["id"]
 
 
 def _fingerprint(obj: dict[str, Any]) -> str:
@@ -248,16 +272,20 @@ def evaluate(conn: sqlite3.Connection, sample: sqlite3.Row) -> dict[str, Any]:
     其内容经 superseded_events 与 corrections 永久留痕、可追溯。
     """
     all_rows = conn.execute(
-        "SELECT * FROM custody_event WHERE sample_id = ? ORDER BY occurred_at ASC, id ASC",
+        "SELECT * FROM custody_event WHERE sample_id = ?",
         (sample["id"],),
     ).fetchall()
+    # occurred_at 文本存在整秒/小数秒两种形态，不能按字符串排序；按真实瞬间（同瞬间按 id）。
+    all_rows.sort(key=event_time_key)
     events = [e for e in all_rows if e["superseded_by"] is None]
     superseded_rows = [e for e in all_rows if e["superseded_by"] is not None]
 
     current = sample["collector"]                       # 当前保管人（初始为采集人）
     open_transfer: dict[str, Any] | None = None         # 在途移交（已移交未签收）
     closed_transfer_nos: set[str] = set()               # 已正常签收的移交单
-    last_receive_at: str | None = None
+    last_receive_at: datetime | None = None
+    last_receive_at_iso: str | None = None
+    collected_at = parse_iso(sample["collected_at"])    # 采集瞬间（真实精度比较）
     stored = False
     storage_without_chain = False                       # 入库节点缺失前序签收（链不完整）
     invalid_reasons: list[str] = []
@@ -288,7 +316,8 @@ def evaluate(conn: sqlite3.Connection, sample: sqlite3.Row) -> dict[str, Any]:
         )
 
         # 任何事件早于采集时间：记录无效（不可能在登记采集前发生保管动作）
-        if ev["occurred_at"] < sample["collected_at"]:
+        ev_time = parse_iso(ev["occurred_at"])
+        if ev_time < collected_at:
             invalid_reasons.append(f"{ref} 事件发生时间 {ev['occurred_at']} 早于样本采集时间 {sample['collected_at']}")
             continue
 
@@ -307,7 +336,7 @@ def evaluate(conn: sqlite3.Connection, sample: sqlite3.Row) -> dict[str, Any]:
                     f"{ref} 移交人 {frm} 不是当前保管人 {current}（移交单 {no}，保管人断链）"
                 )
                 continue
-            open_transfer = {"transfer_no": no, "event_id": ev["event_id"], "from_custodian": frm, "to_custodian": to, "occurred_at": ev["occurred_at"]}
+            open_transfer = {"transfer_no": no, "event_id": ev["event_id"], "from_custodian": frm, "to_custodian": to, "occurred_at": ev["occurred_at"], "_time": ev_time}
             # 签收完成前保管人不变，仍为移交人
 
         elif et == "receive":
@@ -317,7 +346,7 @@ def evaluate(conn: sqlite3.Connection, sample: sqlite3.Row) -> dict[str, Any]:
                 continue
             known = transfer_by_no.get(no)
             if open_transfer is None or open_transfer["transfer_no"] != no:
-                if known is not None and ev["occurred_at"] <= known["row"]["occurred_at"]:
+                if known is not None and ev_time <= parse_iso(known["row"]["occurred_at"]):
                     invalid_reasons.append(
                         f"{ref} 签收时间 {ev['occurred_at']} 不晚于移交时间 {known['row']['occurred_at']}（单号 {no}）"
                     )
@@ -337,7 +366,7 @@ def evaluate(conn: sqlite3.Connection, sample: sqlite3.Row) -> dict[str, Any]:
                     f"{ref} 封签号不符：签收封签 {p['seal_no']} ≠ 登记封签 {sample['seal_no']}"
                 )
                 mismatch = True
-            if ev["occurred_at"] <= open_transfer["occurred_at"]:
+            if ev_time <= open_transfer["_time"]:
                 invalid_reasons.append(
                     f"{ref} 签收时间 {ev['occurred_at']} 不晚于移交时间 {open_transfer['occurred_at']}（单号 {no}）"
                 )
@@ -348,7 +377,8 @@ def evaluate(conn: sqlite3.Connection, sample: sqlite3.Row) -> dict[str, Any]:
 
             closed_transfer_nos.add(no)
             current = p["receiver"]
-            last_receive_at = ev["occurred_at"]
+            last_receive_at = ev_time
+            last_receive_at_iso = ev["occurred_at"]
             open_transfer = None
 
         elif et == "seal_check":
@@ -360,9 +390,9 @@ def evaluate(conn: sqlite3.Connection, sample: sqlite3.Row) -> dict[str, Any]:
                 invalid_reasons.append(f"{ref} 封签检查发现封签破损/不完好")
 
         else:  # storage
-            if last_receive_at is not None and ev["occurred_at"] < last_receive_at:
+            if last_receive_at is not None and ev_time < last_receive_at:
                 invalid_reasons.append(
-                    f"{ref} 入库时间 {ev['occurred_at']} 早于最终签收时间 {last_receive_at}（保管链不成立）"
+                    f"{ref} 入库时间 {ev['occurred_at']} 早于最终签收时间 {last_receive_at_iso}（保管链不成立）"
                 )
                 continue
             if open_transfer is not None or last_receive_at is None:
@@ -373,6 +403,8 @@ def evaluate(conn: sqlite3.Connection, sample: sqlite3.Row) -> dict[str, Any]:
             current = p.get("custodian") or LAB_CUSTODIAN
 
     # ------------------------------------------------------------ 汇总（无效优先）
+    if open_transfer is not None:
+        open_transfer = {k: v for k, v in open_transfer.items() if k != "_time"}
     pending_reasons: list[str] = []
     if open_transfer is not None:
         pending_reasons.append(
